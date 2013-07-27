@@ -23,6 +23,8 @@
 # ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 # (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 # SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+from collections import namedtuple
+from functools import partial
 from pymaging.colors import RGB
 from pymaging.image import Image
 from pymaging.formats import Format
@@ -32,136 +34,136 @@ import struct
 from pymaging.pixelarray import get_pixel_array
 
 
-def BITMAPINFOHEADER(decoder):
-    (decoder.width, decoder.height, decoder.nplanes, decoder.bits_per_pixel,
-     decoder.compression_method, decoder.bmp_bytesz, decoder.hres, decoder.vres,
-     decoder.ncolors, decoder.nimpcolors) = struct.unpack_from('<IihhiiIIii', decoder.fileobj.read(36))
-    assert decoder.nplanes == 1, decoder.nplanes
-    if decoder.bits_per_pixel == 32:
-        decoder.read_row = decoder.read_row_32bit
-        decoder.pixelsize = 3
-    elif decoder.bits_per_pixel == 24:
-        decoder.read_row = decoder.read_row_24bit
-        decoder.pixelsize = 3
-    elif decoder.bits_per_pixel == 1:
-        decoder.pixelsize = 1
-        decoder.read_row = decoder.read_row_1bit
-
-def BITMAPV2INFOHEADER(decoder):
-    BITMAPINFOHEADER(decoder)
-
-def BITMAPV3INFOHEADER(decoder):
-    BITMAPINFOHEADER(decoder)
-
-def BITMAPV4HEADER(decoder):
-    BITMAPINFOHEADER(decoder)
-    
-def BITMAPV5HEADER(decoder):
-    BITMAPINFOHEADER(decoder)
-
-HEADERS = {
-    40: BITMAPINFOHEADER,
-    52: BITMAPV2INFOHEADER,
-    56: BITMAPV3INFOHEADER,
-    108: BITMAPV4HEADER,
-    124: BITMAPV5HEADER,
+PIXEL_SIZES = {
+    32: 3,
+    24: 3,
+    1: 1,
 }
 
-class BMPDecoder(object):
-    def __init__(self, fileobj):
-        self.fileobj = fileobj
-        self.read_header()
-    
-    def read_header(self):
-        magic = struct.unpack('<bb', self.fileobj.read(2))
-        assert magic == (66, 77), magic
-        self.filelength = struct.unpack('<i', self.fileobj.read(4))[0]
-        self.fileobj.read(4) # reserved/unused stuff
-        self.offset = struct.unpack('<i', self.fileobj.read(4))[0]
-        pre_header = self.fileobj.tell()
-        headersize = struct.unpack('<i', self.fileobj.read(4))[0]
-        palette_start = pre_header + headersize
-        # this will set the following attributes:
-        #   width
-        #   height
-        #   nplanes
-        #   bits_per_pixel
-        #   compression_method
-        #   bmp_bytesz
-        #   hres
-        #   vres
-        #   ncolors
-        #   nimpcolors
-        #   read_row
-        #   pixelsize
-        HEADERS[headersize](self)
+
+class BMPHeader(object):
+    def __init__(self, width, height, nplanes, bits_per_pixel, compression_method, bmp_bytesz, hres, vres, ncolors,
+                 nimpcolors, offset, palette_start):
+        self.width = width
+        self.height = height
+        self.nplanes = nplanes
+        self.bits_per_pixel = bits_per_pixel
+        self.compression_method = compression_method
+        self.bmp_bytesz = bmp_bytesz
+        self.hres = hres
+        self.vres = vres
+        self.ncolors = ncolors
+        self.nimpcolors = nimpcolors
+        self.offset = offset
+        self.palette_start = palette_start
+        self.pixelsize = PIXEL_SIZES[self.bits_per_pixel]
         self.pixelwidth = self.width * self.pixelsize
-        self.row_size = ((self.bits_per_pixel * self.width) // 32) * 4
-        # there might be header stuff that wasn't read, so skip ahead to the 
-        # start of the color palette
-        self.fileobj.seek(palette_start) 
-        palette = []
-        for _ in range(self.ncolors):
-            blue, green, red, _ = struct.unpack('<BBBB', self.fileobj.read(4))
-            palette.append((red, green, blue))
-        # set palette to None instead of empty list when there's no palette
-        self.palette = palette or None
-    
-    def read_row_32bit(self, pixel_array, row_num):
-        row_start = row_num * self.pixelwidth
-        for x in range(self.width):
-            # not sure what the first thing is used for 
-            _, b, g, r =  struct.unpack('<BBBB', self.fileobj.read(4))
-            start = row_start + (x * self.pixelsize)
-            pixel_array.data[start] = r
-            pixel_array.data[start + 1] = g
-            pixel_array.data[start + 2] = b
 
-    def read_row_24bit(self, pixel_array, row_num):
-        row = array.array('B')
-        row.fromfile(self.fileobj, self.pixelwidth)
-        start = row_num * self.pixelwidth
-        end = start + self.pixelwidth
-        pixel_array.data[start:end] = row
-        self.fileobj.read(self.pixelwidth % 4) # padding
 
-    def read_row_1bit(self, pixel_array, row_num):
-        padding = 32 - (self.width % 32)
-        row_length = (self.width + padding) // 8
-        start = row_num * self.pixelwidth
-        item = 0
-        for b in struct.unpack('%sB' % row_length, self.fileobj.read(row_length)):
-            for _ in range(8):
-                a, b = divmod(b, 128)
-                pixel_array.data[start + item] = a
-                item += 1
-                if item >= self.width:
-                    return
-                b <<= 1
+def BITMAPINFOHEADER(fileobj, offset, palette_start):
+    raw_headers = struct.unpack_from('<IihhiiIIii', fileobj.read(36))
+    raw_headers += (offset, palette_start)
+    headers = BMPHeader(*raw_headers)
+    if headers.nplanes != 1:
+        raise ValueError("Unexpected nplanes: %r" % headers.nplanes)
+    return headers
 
-    def get_image(self):
-        # go to the start of the pixel array
-        self.fileobj.seek(self.offset)
-        # since bmps are stored upside down, initialize a pixel list
-        initial = array.array('B', [0] * self.width * self.height * self.pixelsize)
-        pixel_array = get_pixel_array(initial, self.width, self.height, self.pixelsize)
-        # iterate BACKWARDS over the line indices so we don't have to reverse
-        # later. this is why we intialize pixels above.
-        for row_num in range(self.height - 1, -1, -1):
-            self.read_row(pixel_array, row_num)
-        # TODO: Not necessarily RGB
+HEADER_READERS = {
+    40: BITMAPINFOHEADER,
+    52: BITMAPINFOHEADER,
+    56: BITMAPINFOHEADER,
+    108: BITMAPINFOHEADER,
+    124: BITMAPINFOHEADER,
+}
 
-        return Image(pixel_array, RGB, palette=self.palette)
 
-def decode(fileobj):
+def read_row_32bit(fileobj, headers, pixel_array, row_num):
+    row_start = row_num * headers.pixelwidth
+    for x in range(headers.width):
+        # not sure what the first thing is used for
+        _, b, g, r =  struct.unpack('<BBBB', fileobj.read(4))
+        start = row_start + (x * headers.pixelsize)
+        pixel_array.data[start] = r
+        pixel_array.data[start + 1] = g
+        pixel_array.data[start + 2] = b
+
+def read_row_24bit(fileobj, headers, pixel_array, row_num):
+    row = array.array('B')
+    row.fromfile(fileobj, headers.pixelwidth)
+    start = row_num * headers.pixelwidth
+    end = start + headers.pixelwidth
+    pixel_array.data[start:end] = row
+    fileobj.read(headers.pixelwidth % 4) # padding
+
+def read_row_1bit(fileobj, headers, pixel_array, row_num):
+    padding = 32 - (headers.width % 32)
+    row_length = (headers.width + padding) // 8
+    start = row_num * headers.pixelwidth
+    item = 0
+    for b in struct.unpack('%sB' % row_length, fileobj.read(row_length)):
+        for _ in range(8):
+            a, b = divmod(b, 128)
+            pixel_array.data[start + item] = a
+            item += 1
+            if item >= headers.width:
+                return
+            b <<= 1
+
+
+ROW_READERS = {
+    32: read_row_32bit,
+    24: read_row_24bit,
+    1: read_row_1bit,
+}
+
+
+def read_headers(fileobj):
+    magic = struct.unpack('<bb', fileobj.read(2))
+    if magic != (66, 77):
+        raise ValueError("Invalid magic number: %r" % magic)
+    struct.unpack('<i', fileobj.read(4))[0] # file length
+    fileobj.read(4) # reserved/unused stuff
+    offset = struct.unpack('<i', fileobj.read(4))[0]
+    pre_header = fileobj.tell()
+    headersize = struct.unpack('<i', fileobj.read(4))[0]
+    palette_start = pre_header + headersize
+    return HEADER_READERS[headersize](fileobj, offset, palette_start)
+
+
+def read_pixels(fileobj, headers):
+    fileobj.seek(headers.palette_start)
+    palette = []
+    for _ in range(headers.ncolors):
+        blue, green, red, _ = struct.unpack('<BBBB', fileobj.read(4))
+        palette.append((red, green, blue))
+    # set palette to None instead of empty list when there's no palette
+    palette = palette or None
+
+    read_row = ROW_READERS[headers.bits_per_pixel]
+
+    fileobj.seek(headers.offset)
+    # since bmps are stored upside down, initialize a pixel list
+    initial = array.array('B', [0] * headers.width * headers.height * headers.pixelsize)
+    pixel_array = get_pixel_array(initial, headers.width, headers.height, headers.pixelsize)
+    # iterate BACKWARDS over the line indices so we don't have to reverse
+    # later. this is why we intialize pixels above.
+    for row_num in range(headers.height - 1, -1, -1):
+        read_row(fileobj, headers, pixel_array, row_num)
+
+    return pixel_array, palette
+
+
+def open_image(fileobj):
     try:
-        decoder = BMPDecoder(fileobj)
+        headers = read_headers(fileobj)
     except:
         fileobj.seek(0)
         return None
-    return decoder.get_image()
+    loader = partial(read_pixels, fileobj, headers)
+    # TODO: is this really always RGB?
+    return Image(RGB, headers.width, headers.height, loader, meta={'source_format': 'BMP'})
 
-def encode(image, fileobj):
+def save_image(image, fileobj):
     raise FormatNotSupported('bmp')
 
-BMP = Format(decode, encode, ['bmp'])
+BMP = Format(open_image, save_image, ['bmp'])
